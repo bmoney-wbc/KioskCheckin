@@ -1,5 +1,22 @@
 import { getSupabaseClient } from '@/template';
-import { CLINIC_ID } from '@/constants/config';
+import { CLINIC_ID, BRIDGE_URL } from '@/constants/config';
+
+/**
+ * Calls the on-prem bridge directly over the clinic LAN. Used for anything that touches
+ * patient identity or appointment data — never routed through Supabase (see kiosk handoff
+ * doc: no patient roster or appointment data should be synced to or stored in Supabase).
+ */
+async function callBridge<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(`${BRIDGE_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(`bridge_error_${response.status}`);
+  }
+  return response.json();
+}
 
 export interface KioskPatient {
   id: string;
@@ -243,92 +260,13 @@ export async function loadQuestionnaire(questionnaireId?: string): Promise<{
 // ─── Patient Lookup ───────────────────────────────────────────────────────────
 
 /**
- * Updated lookup that returns patient groups supporting multi-case and walk-in flows.
+ * Live DOB lookup against ChiroTouch via the local bridge — no patient roster is
+ * pre-synced to Supabase. Groups patients by name to support multi-case flows, same
+ * shape the bridge already returns.
  */
 export async function lookupPatientsByDOB(birthDate: string): Promise<LookupResult> {
   try {
-    const supabase = getSupabaseClient();
-
-    // 1. Find all patients with this DOB at this clinic
-    const { data: patients, error: pError } = await supabase
-      .from('kiosk_patients')
-      .select('*')
-      .eq('clinic', CLINIC_ID)
-      .eq('birth_date', birthDate)
-      .eq('is_active', true);
-
-    if (pError) throw pError;
-    if (!patients || patients.length === 0) return { groups: [], error: null };
-
-    const patientIds = patients.map((p: KioskPatient) => p.ct_patient_id);
-
-    // 2. Find today's appointments for all matched patients (not yet arrived)
-    const today = new Date();
-    const todayStr = today.toISOString().split('T')[0];
-
-    const { data: appointments, error: aError } = await supabase
-      .from('kiosk_appointments')
-      .select('*')
-      .eq('clinic', CLINIC_ID)
-      .eq('is_arrived', false)
-      .in('ct_patient_id', patientIds)
-      .gte('schedule_date_time', `${todayStr}T00:00:00.000Z`)
-      .lte('schedule_date_time', `${todayStr}T23:59:59.999Z`);
-
-    if (aError) throw aError;
-
-    const apptList: KioskAppointment[] = appointments || [];
-
-    // 3. Load behavior map for all case types
-    const caseTypes = [...new Set(patients.map((p: KioskPatient) => p.case_type).filter(Boolean))];
-    let behaviorMap: Record<string, string> = {};
-
-    if (caseTypes.length > 0) {
-      const { data: mappings, error: mError } = await supabase
-        .from('kiosk_case_type_questionnaire_map')
-        .select('case_type, behavior')
-        .in('case_type', caseTypes);
-
-      if (!mError && mappings) {
-        mappings.forEach((m: { case_type: string; behavior: string }) => {
-          behaviorMap[m.case_type] = m.behavior;
-        });
-      }
-    }
-
-    // 4. Group patients by name (first+last)
-    const nameGroupMap: Record<string, PatientGroup> = {};
-
-    for (const patient of patients) {
-      const nameKey = `${patient.first_name.toLowerCase()}|${patient.last_name.toLowerCase()}`;
-
-      if (!nameGroupMap[nameKey]) {
-        nameGroupMap[nameKey] = {
-          firstName: patient.first_name,
-          lastName: patient.last_name,
-          cases: [],
-          casesWithAppointments: [],
-          hasAppointments: false,
-        };
-      }
-
-      nameGroupMap[nameKey].cases.push(patient);
-
-      // Check if this patient/case has an appointment today
-      const appt = apptList.find(
-        (a: KioskAppointment) => a.ct_patient_id === patient.ct_patient_id
-      );
-      if (appt) {
-        const behavior = patient.case_type
-          ? ((behaviorMap[patient.case_type] as 'questionnaire' | 'arrival_only') ?? null)
-          : null;
-        nameGroupMap[nameKey].casesWithAppointments.push({ patient, appointment: appt, behavior });
-        nameGroupMap[nameKey].hasAppointments = true;
-      }
-    }
-
-    const groups = Object.values(nameGroupMap);
-    return { groups, error: null };
+    return await callBridge<LookupResult>('/lookup', { birthDate });
   } catch (err) {
     console.error('lookupPatientsByDOB error:', err);
     return { groups: [], error: 'lookup_error' };
@@ -341,66 +279,29 @@ export async function createWalkInAppointment(
   patient: KioskPatient
 ): Promise<{ appointment: KioskAppointment | null; error: string | null }> {
   try {
-    const supabase = getSupabaseClient();
-    const now = new Date().toISOString();
-
-    const { data, error } = await supabase
-      .from('kiosk_appointments')
-      .insert({
-        clinic: CLINIC_ID,
-        ct_appointment_id: 0,
-        ct_patient_id: patient.ct_patient_id,
-        ct_doctor_id: 0,
-        schedule_date_time: now,
-        purpose_of_visit: 'Walk-In',
-        status: 1000,
-        is_walk_in: true,
-        is_arrived: false,
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-    return { appointment: data as KioskAppointment, error: null };
+    return await callBridge('/walkin', { ct_patient_id: patient.ct_patient_id });
   } catch (err) {
     console.error('createWalkInAppointment error:', err);
     return { appointment: null, error: 'create_error' };
   }
 }
 
-// ─── Update Patient Language Preference ─────────────────────────────────────
-
-export async function updatePatientLanguage(
-  patientId: string,
-  language: string
-): Promise<void> {
-  try {
-    const supabase = getSupabaseClient();
-    await supabase
-      .from('kiosk_patients')
-      .update({ preferred_language: language })
-      .eq('id', patientId);
-  } catch (err) {
-    console.error('updatePatientLanguage error:', err);
-  }
-}
-
 // ─── Mark Arrived ─────────────────────────────────────────────────────────────
+// Fires immediately on GreetingScreen "Continue" — before the questionnaire is filled
+// out — same moment ChiroTouch's own kiosk marks arrival. Runs the PSChiroLib COM
+// CheckIn() call on the bridge (see CTCheckinHelper), not a raw SQL UPDATE, so
+// CTProvider should refresh instantly the way it does for native check-ins.
 
 export async function markArrived(
-  clinicId: string,
-  appointmentRowId: string
+  ctPatientId: number,
+  ctAppointmentId: number
 ): Promise<{ error: string | null }> {
   try {
-    const supabase = getSupabaseClient();
-    const { error } = await supabase
-      .from('kiosk_appointments')
-      .update({ is_arrived: true, updated_at: new Date().toISOString() })
-      .eq('clinic', clinicId)
-      .eq('id', appointmentRowId);
-
-    if (error) throw error;
-    return { error: null };
+    const result = await callBridge<{ error: string | null }>('/arrive', {
+      ctPatientId,
+      ctAppointmentId,
+    });
+    return result;
   } catch (err) {
     console.error('markArrived error:', err);
     return { error: 'update_error' };
@@ -408,75 +309,28 @@ export async function markArrived(
 }
 
 // ─── Submit Questionnaire ─────────────────────────────────────────────────────
+// Arrival already happened via markArrived — this only writes the composed subjective
+// text into the chart.
 
 export async function submitQuestionnaire(
   params: SubmitQuestionnaireParams
 ): Promise<{ error: string | null }> {
   try {
-    const supabase = getSupabaseClient();
-    const now = new Date().toISOString();
+    const complaints = params.complaints.map((c, i) => ({
+      complaintNum: c.complaintNum,
+      composedText: params.composedTexts[i] ?? '',
+      answers: c.answers,
+    }));
 
-    // Mark arrived by row UUID
-    const { error: arrivedError } = await supabase
-      .from('kiosk_appointments')
-      .update({ is_arrived: true, updated_at: now })
-      .eq('clinic', CLINIC_ID)
-      .eq('id', params.appointmentRowId);
-    if (arrivedError) throw arrivedError;
-
-    const isWalkIn = params.isWalkIn ?? false;
-
-    // Insert one row per complaint
-    for (let i = 0; i < params.complaints.length; i++) {
-      const complaint = params.complaints[i];
-      const { error: insertError } = await supabase
-        .from('kiosk_pending_subjectives')
-        .insert({
-          clinic: CLINIC_ID,
-          ct_patient_id: params.ctPatientId,
-          ct_appointment_id: params.ctAppointmentId,
-          ct_doctor_id: params.ctDoctorId,
-          questionnaire_id: params.questionnaireId,
-          complaint_num: complaint.complaintNum,
-          composed_text: params.composedTexts[i] ?? '',
-          composed_text_no_symptoms: '',
-          raw_answers: complaint.answers,
-          patient_language: params.patientLanguage,
-          behavior: 'questionnaire',
-          status: 'pending',
-          is_walk_in: isWalkIn,
-          submitted_at: now,
-        });
-      if (insertError) throw insertError;
-    }
-
-    // Insert general answers row (complaint_num = 0)
-    const { error: genError } = await supabase
-      .from('kiosk_pending_subjectives')
-      .insert({
-        clinic: CLINIC_ID,
-        ct_patient_id: params.ctPatientId,
-        ct_appointment_id: params.ctAppointmentId,
-        ct_doctor_id: params.ctDoctorId,
-        questionnaire_id: params.questionnaireId,
-        complaint_num: 0,
-        composed_text: params.generalComposedText,
-        composed_text_no_symptoms: '',
-        raw_answers: params.generalAnswers,
-        patient_language: params.patientLanguage,
-        behavior: 'questionnaire',
-        status: 'pending',
-        is_walk_in: isWalkIn,
-        submitted_at: now,
-      });
-    if (genError) throw genError;
-
-    // Update patient language preference if it changed
-    if (params.patientLanguage !== params.storedLanguage) {
-      await updatePatientLanguage(params.patientId, params.patientLanguage);
-    }
-
-    return { error: null };
+    const result = await callBridge<{ error: string | null }>('/checkin', {
+      ctPatientId: params.ctPatientId,
+      ctAppointmentId: params.ctAppointmentId,
+      ctDoctorId: params.ctDoctorId,
+      complaints,
+      generalComposedText: params.generalComposedText,
+      generalAnswers: params.generalAnswers,
+    });
+    return result;
   } catch (err) {
     console.error('submitQuestionnaire error:', err);
     return { error: 'submit_error' };
@@ -484,63 +338,14 @@ export async function submitQuestionnaire(
 }
 
 // ─── Submit Arrival Only ──────────────────────────────────────────────────────
+// Cash/arrival-only patients have no chart note to write — arrival already happened
+// via markArrived, so there's nothing left to do here. Kept as a function (rather than
+// removed) so screens don't need restructuring.
 
 export async function submitArrivalOnly(
-  params: SubmitArrivalOnlyParams
+  _params: SubmitArrivalOnlyParams
 ): Promise<{ error: string | null }> {
-  try {
-    const supabase = getSupabaseClient();
-    const now = new Date().toISOString();
-
-    const isWalkIn = params.isWalkIn ?? false;
-
-    // For walk-ins (ct_appointment_id=0), skip mark-arrived since we just created the record
-    if (!isWalkIn) {
-      const { error: arrivedError } = await supabase
-        .from('kiosk_appointments')
-        .update({ is_arrived: true, updated_at: now })
-        .eq('clinic', CLINIC_ID)
-        .eq('id', params.appointmentRowId);
-      if (arrivedError) throw arrivedError;
-    } else {
-      // Mark the walk-in appointment arrived by row id
-      await supabase
-        .from('kiosk_appointments')
-        .update({ is_arrived: true, updated_at: now })
-        .eq('clinic', CLINIC_ID)
-        .eq('id', params.appointmentRowId);
-    }
-
-    const { error: insertError } = await supabase
-      .from('kiosk_pending_subjectives')
-      .insert({
-        clinic: CLINIC_ID,
-        ct_patient_id: params.ctPatientId,
-        ct_appointment_id: params.ctAppointmentId,
-        ct_doctor_id: params.ctDoctorId,
-        questionnaire_id: null,
-        complaint_num: 0,
-        composed_text: '',
-        composed_text_no_symptoms: '',
-        raw_answers: {},
-        patient_language: params.patientLanguage,
-        behavior: 'arrival_only',
-        status: 'pending',
-        is_walk_in: isWalkIn,
-        submitted_at: now,
-      });
-    if (insertError) throw insertError;
-
-    // Update patient language preference if it changed
-    if (params.patientLanguage !== params.storedLanguage) {
-      await updatePatientLanguage(params.patientId, params.patientLanguage);
-    }
-
-    return { error: null };
-  } catch (err) {
-    console.error('submitArrivalOnly error:', err);
-    return { error: 'submit_error' };
-  }
+  return { error: null };
 }
 
 // ─── Admin: Case Type Mapping ─────────────────────────────────────────────────

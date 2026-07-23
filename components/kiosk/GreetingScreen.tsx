@@ -4,7 +4,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Colors, Typography, Spacing, Radius, Shadow } from '@/constants/theme';
 import { LanguageToggle } from '@/components/ui/LanguageToggle';
 import { KioskMatch, markArrived } from '@/services/kioskService';
-import { CLINIC_ID, ERROR_AUTO_RETURN_DELAY } from '@/constants/config';
+import { ERROR_AUTO_RETURN_DELAY } from '@/constants/config';
 import { Language } from '@/app/index';
 
 const T = {
@@ -76,8 +76,9 @@ export function GreetingScreen({
     }
 
     setLoading(true);
-    // Mark arrived using row UUID (works for both scheduled and walk-in appointments)
-    const { error } = await markArrived(CLINIC_ID, match.appointment.id);
+    // Marks arrived via the local bridge's PSChiroLib COM CheckIn() call — the actual
+    // check-in moment, before the questionnaire is filled out.
+    const { error } = await markArrived(match.patient.ct_patient_id, match.appointment.ct_appointment_id);
     setLoading(false);
 
     if (error) {
